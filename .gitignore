@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.spec
+.pytest_cache/
+*.epub
+*.tts/
+*.tts.txt
+*.cleanup.json
+清洗记录.json
+冒烟测试/
+发行版/
+使用说明.txt
