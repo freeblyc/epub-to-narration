@@ -80,6 +80,41 @@ class EpubCleanupTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "没有可提取的正文"):
             extract(self.book, "pandoc")
 
+    def test_repairs_prose_breaks_and_keeps_structural_line_breaks(self):
+        make_book(self.book, [("chapter", "chapter.xhtml", """
+<h1>第一章</h1>
+<p>作者在这句话的中<br />间换了一行。<br />但仍然属于同一个段落。</p>
+<p>Sentence one.<br /><em>Sentence two.</em></p>
+<p>这里是另一个段落。</p>
+<p class="poem">风从江上来<br />月向山中落</p>
+<ul><li>列表第一行<br />列表第二行</li></ul>
+<table><tr><td>上半格<br />下半格</td></tr></table>
+<pre>alpha
+beta</pre>
+""")])
+        text, report = extract(self.book, "pandoc")
+        self.assertIn("作者在这句话的中间换了一行。但仍然属于同一个段落。", text)
+        self.assertIn("Sentence one. Sentence two.", text)
+        self.assertIn("Sentence two.\n\n这里是另一个段落。", text)
+        self.assertIn("风从江上来\n月向山中落", text)
+        self.assertNotIn("列表第一行列表第二行", text)
+        self.assertNotIn("上半格下半格", text)
+        self.assertRegex(text, r"alpha\n[ \t]*beta")
+        self.assertEqual(report["硬换行修复"]["段内换行"], 3)
+
+    def test_repairs_printed_lines_without_gluing_indented_paragraphs(self):
+        one = "甲乙丙丁" * 9
+        two = "天地玄黄" * 9
+        first = f"<p>    {one[:-2]}。</p>" + f"<p>{one}</p>" * 5 + "<p>第一段结束。</p>"
+        second = f"<p>    {two[:-2]}</p>" + f"<p>{two}</p>" * 5 + "<p>第二段结束。</p>"
+        make_book(self.book, [("chapter", "chapter.xhtml",
+                              "<h1>第一章</h1>" + first + second)])
+        text, report = extract(self.book, "pandoc")
+        self.assertIn(f"{one[:-2]}。{one}", text)
+        self.assertIn(f"第一段结束。\n\n{two[:-2]}{two}", text)
+        self.assertIn(f"{two}第二段结束。", text)
+        self.assertEqual(report["硬换行修复"]["逐行段落"], 12)
+
     def test_folder_continues_after_a_broken_book_and_skips_existing_output(self):
         make_book(self.book, [("chapter", "chapter.xhtml", "<h1>第一章</h1><p>这是正文。</p>")])
         (self.book.parent / "000损坏.epub").write_bytes(b"invalid zip data")
@@ -124,6 +159,7 @@ class EpubCleanupTest(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertEqual(main([str(self.book), "-o", str(destination), "--split", "--report"]), 0)
         log = json.loads((destination / "清洗记录.json").read_text(encoding="utf-8"))
+        self.assertEqual(log["文件"], self.book.name)
         self.assertEqual([part["类型"] for part in log["分段"]],
                          ["书前内容", "序言", "译者说明", "分部", "正文", "正文", "后记", "附录"])
         files = sorted(destination.glob("*.txt"))

@@ -23,6 +23,7 @@ except ImportError:
     raise SystemExit("缺少 lxml。请运行 python -m pip install lxml。")
 
 from clean_for_tts import mark_contents, mark_front, mark_page_noise, normalize, render, title_key, write_new
+from epub_reflow import reflow_document
 from epub_sections import (
     EXTRA_ROLE, FRONT_EXTRA, MINOR, NavEntry, Section, named_kind, navigation_is_major, split_parts,
 )
@@ -797,6 +798,7 @@ def build_narration(source, pandoc, book_title=None, split=False):
     printable = etree.Element("html")
     body = etree.SubElement(printable, "body")
     counts = Counter()
+    reflowed_inside = reflowed_lines = 0
     retained_files = 0
     sections = {}
     if split:
@@ -822,6 +824,10 @@ def build_narration(source, pandoc, book_title=None, split=False):
         if not content(doc.body).strip("\ufeff\u200b "):
             continue
         labels = {label_key(entry.title) for entry in nav[doc.path] if not kind_of(entry.title)}
+        fragments = {entry.fragment for entry in nav[doc.path] if entry.fragment}
+        inside, lines = reflow_document(doc.body, labels, fragments, label_key)
+        reflowed_inside += inside
+        reflowed_lines += lines
         rows = text_rows(doc.body)
         titles = [value for node, value in rows
                   if tag(node) in HEADINGS or label_key(value) in labels]
@@ -852,7 +858,7 @@ def build_narration(source, pandoc, book_title=None, split=False):
     if not text:
         raise ValueError("清洗后的正文为空。")
     report = {
-        "文件": str(source),
+        "文件": source.name,
         "书名": title,
         "阅读顺序文件数": len(docs),
         "保留文件数": retained_files,
@@ -860,6 +866,7 @@ def build_narration(source, pandoc, book_title=None, split=False):
         "未读入的条目": skipped,
         "删除元素": dict(sorted(counts.items())),
         "纯文本补充清洗": dict(removed),
+        "硬换行修复": {"段内换行": reflowed_inside, "逐行段落": reflowed_lines},
         "可定位标题": chapters,
         "输出字符数": len(text),
         "Pandoc 提示": pandoc_warning,
