@@ -71,7 +71,10 @@ def process_books(sources, destination, split, audit, pandoc, preview, stop, pub
                         skipped += 1
                         publish(ConversionEvent("skipped", source, str(collision)))
                         continue
-                text, report, parts = build_narration(source, pandoc, split=split)
+                text, report, parts = build_narration(
+                    source, pandoc, split=split,
+                    progress=lambda detail: publish(ConversionEvent("progress", source, detail)),
+                )
                 if preview:
                     publish(ConversionEvent("preview", source, report=report))
                 else:
@@ -389,6 +392,8 @@ class NarrationWindow:
             self.status.set(f"{action}　{event.source.stem[:24]}")
             if not self.previewing:
                 self.set_row(event.source, "转换中")
+        elif event.kind == "progress":
+            self.status.set(f"{event.detail}　{event.source.stem[:24]}")
         elif event.kind in {"done", "skipped", "failed"}:
             state = {"done": "已完成", "skipped": "已存在，跳过", "failed": "失败"}[event.kind]
             if not self.previewing:

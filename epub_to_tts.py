@@ -23,9 +23,11 @@ except ImportError:
     raise SystemExit("缺少 lxml。请运行 python -m pip install lxml。")
 
 from clean_for_tts import mark_contents, mark_front, mark_page_noise, normalize, render, title_key, write_new
+from epub_navigation import LITERAL_SPACE, ROUND_HEADING, align_chapters, chapter_title
 from epub_reflow import reflow_document
+from epub_scan import HAN, find_scan_pages, render_scan
 from epub_sections import (
-    EXTRA_ROLE, FRONT_EXTRA, MINOR, NavEntry, Section, named_kind, navigation_is_major, split_parts,
+    CHAPTER, EXTRA_ROLE, FRONT_EXTRA, MINOR, NavEntry, Section, named_kind, navigation_is_major, split_parts,
 )
 
 
@@ -370,6 +372,18 @@ def row_anchor_ids(node):
     return output
 
 
+def heading_anchor_ids(node):
+    ids = {value for value in (node.get("id"), node.get("name")) if value}
+    if not (node.text or "").strip():
+        for child in node:
+            if tag(child) != "a" or child.get("href") or content(child):
+                break
+            ids.update(value for value in (child.get("id"), child.get("name")) if value)
+            if (child.tail or "").strip():
+                break
+    return ids
+
+
 def covered(node, marked):
     return node in marked or any(parent in marked for parent in node.iterancestors())
 
@@ -440,6 +454,20 @@ def classify_nodes(doc, marked):
         if sum(1 for candidate in links for child in candidate.iter() if tag(child) == "a") >= 2:
             marked[node] = "目录或导航块"
             marked.update(dict.fromkeys(links, "目录或导航块"))
+
+
+def continue_inline_toc(doc, rows, marked, doc_paths):
+    leading = []
+    for row, text in rows:
+        links = [link for link in row.iter() if tag(link) == "a" and link.get("href")]
+        if not links or label_key(text) != label_key("".join(content(link) for link in links)):
+            break
+        targets = [resolve(doc.path, link.get("href")) for link in links]
+        if any(not target or target[0] not in doc_paths or not target[1] for target in targets):
+            break
+        leading.append(row)
+    if len(leading) >= 2:
+        marked.update(dict.fromkeys(leading, "目录或导航块"))
 
 
 def mark_note_links(docs, marked):
@@ -676,13 +704,13 @@ def split_navigation(docs, nav, marked, title):
     for path, entry in locations:
         if entry.parents:
             targets[entry.parents].add(path)
+    numbered_roots = {entry.parents for entry in active if named_kind(entry.title) == "正文"}
     anthology = {entry.title for path, entry in locations if not entry.parents
                  and not named_kind(entry.title) and not chapter_key(entry.title)
-                 and len(targets.get((entry.title,), ())) > 1
-                 and path in targets[(entry.title,)]}
+                 and ((entry.title,) in numbered_roots or (
+                     len(targets.get((entry.title,), ())) > 1 and path in targets[(entry.title,)]))}
     if len(anthology) >= 2:
         groups.update(anthology)
-    numbered_roots = {entry.parents for entry in active if named_kind(entry.title) == "正文"}
     has_major = any(navigation_is_major(entry, groups, numbered_roots) for entry in active
                     if not named_kind(entry.title))
     explicit_chapters = any(
@@ -697,18 +725,58 @@ def unmarked_title(value):
     return re.sub(r"\s*(?:[\[［]\s*\d{1,3}\s*[\]］]|[(（]\s*\d{1,2}\s*[)）])\s*$", "", value)
 
 
-def mark_sections(doc, rows, entries, policy, marker_prefix, decisions):
+def anchored_title_matches(title, label, entry):
+    target = label_key(unmarked_title(entry.title))
+    if label == target:
+        return True
+    # Some conversions put the chapter number and its subtitle in separate paragraphs.
+    if CHAPTER.fullmatch(normalize(title)):
+        return bool(CHAPTER.match(normalize(entry.title))) and chapter_key(title) == chapter_key(entry.title)
+    kind = named_kind(title)
+    return kind in {"序言", "译者说明", "后记", "附录", "分部"} and len(label) <= 12 and (
+        named_kind(entry.title) == kind and target.startswith(label)
+    )
+
+
+def inline_chapter_navigation(docs, marked):
+    doc_paths = {doc.path for doc in docs if doc.body not in marked}
+    for doc in docs:
+        for link in doc.body.iter():
+            if tag(link) != "a" or not link.get("href"):
+                continue
+            if not any(marked.get(node) in {"目录", "目录或导航块"} for node in link.iterancestors()):
+                continue
+            title = content(link)
+            if not CHAPTER.match(normalize(title)) or len(title) > 120:
+                continue
+            point = resolve(doc.path, link.get("href"))
+            if point and point[0] in doc_paths and point[1]:
+                yield point[0], NavEntry(point[1], title)
+
+
+def mark_section(node, section, marker_prefix, decisions):
+    token = f"{marker_prefix}{len(decisions)}z"
+    decisions[token] = section
+    node.text = token + " " + (node.text or "")
+
+
+def mark_sections(doc, rows, entries, policy, marker_prefix, decisions, aligned, trust_navigation):
     groups, numbered_roots, use_heading_fallback = policy
     by_label = defaultdict(list)
+    by_fragment = defaultdict(list)
     for entry in entries:
         by_label[label_key(unmarked_title(entry.title))].append(entry)
+        if entry.fragment and not kind_of(entry.title):
+            by_fragment[entry.fragment].append(entry)
     used_entries = set()
     containers = set()
     minimum_level = min((tag(node) for node, _ in rows if tag(node) in HEADINGS), default=None)
     for node, value in rows:
         name = tag(node)
-        if name not in HEADINGS | {"p"} or any(
-            tag(parent) in {"li", "table", "blockquote", "aside"} for parent in node.iterancestors()
+        if node not in aligned and (
+            name not in HEADINGS | {"p"} or ROUND_HEADING.match(normalize(value)) or any(
+                tag(parent) in {"li", "table", "blockquote", "aside"} for parent in node.iterancestors()
+            )
         ):
             continue
         roles = semantics(node)
@@ -716,6 +784,8 @@ def mark_sections(doc, rows, entries, policy, marker_prefix, decisions):
             if tag(parent) in {"body", "section", "article", "div"} and parent not in containers:
                 roles.update(semantics(parent))
                 containers.add(parent)
+        if node in aligned:
+            continue
         semantic_kind = next((kind for role, kind in EXTRA_ROLE.items() if role in roles), None)
         if semantic_kind is None and "chapter" in roles:
             semantic_kind = "正文"
@@ -724,14 +794,14 @@ def mark_sections(doc, rows, entries, policy, marker_prefix, decisions):
 
         title = unmarked_title(value)
         label = label_key(title)
-        row_id = node.get("id") or node.get("name")
+        row_ids = heading_anchor_ids(node)
         candidates = [entry for entry in by_label.get(label, ()) if entry not in used_entries]
-        entry = next((item for item in candidates if item.fragment and item.fragment == row_id), None)
+        anchored = [item for row_id in sorted(row_ids) for item in by_fragment[row_id] if item not in used_entries]
+        entry = next((item for item in anchored if anchored_title_matches(title, label, item)), None)
         if entry is None:
             entry = next((item for item in candidates if not item.fragment or name in HEADINGS), None)
-        if entry is None and row_id:
-            entry = next((item for item in entries if item.fragment == row_id
-                          and item not in used_entries and name in HEADINGS), None)
+        if entry is None and name in HEADINGS and not trust_navigation:
+            entry = next(iter(anchored), None)
         if entry is not None:
             used_entries.add(entry)
         major_nav = entry is not None and navigation_is_major(entry, groups, numbered_roots)
@@ -752,11 +822,52 @@ def mark_sections(doc, rows, entries, policy, marker_prefix, decisions):
             elif major_nav or use_heading_fallback and name == minimum_level:
                 if not MINOR.search(normalize(value)) and not FRONT_EXTRA.fullmatch(normalize(value).rstrip("*")):
                     kind = "正文"
+        if kind == "正文" and trust_navigation:
+            if book_level and title.startswith(("推荐序", "中文版序", "总序")):
+                kind = "序言"
+            elif book_level and title.startswith(("结语", "结论", "代跋", "出版后记", "感悟与致谢", "致谢与感悟")):
+                kind = "后记"
+            elif book_level and title in {"推荐阅读", "历史年表", "参考数据", "实用资料", "大事记"}:
+                kind = "书后内容"
+            else:
+                continue
         if kind is not None:
             display = title if heading or len(title) <= 32 else kind
-            token = f"{marker_prefix}{len(decisions)}z"
-            decisions[token] = Section(display, kind)
-            node.text = token + " " + (node.text or "")
+            if entry in anchored and anchored_title_matches(title, label, entry):
+                display = unmarked_title(entry.title)
+            mark_section(node, Section(display, kind), marker_prefix, decisions)
+
+
+def prepare_chapter_headings(docs, matches):
+    """Keep textual title nodes and restore the text of chapter title images."""
+    by_path = defaultdict(dict)
+    bodies = {doc.path: doc.body for doc in docs}
+    for match in matches:
+        node = match.block.node
+        title = chapter_title(unmarked_title(match.entry.title))
+        if match.from_image:
+            parent = node.getparent()
+            while (parent is not bodies[match.path] and tag(parent) in {"p", "div", "figure", "svg", "a", "span"}
+                   and not content(parent)):
+                node = parent
+                parent = parent.getparent()
+            heading = etree.Element("h2")
+            heading.text = title
+            node.addprevious(heading)
+            node = heading
+        else:
+            for element in list(node.iter()):
+                if isinstance(element, etree._Entity):
+                    if LITERAL_SPACE.fullmatch(element.text):
+                        element.tail = " " + (element.tail or "")
+                        remove_node(element)
+                    continue
+                if tag(element) and element.text:
+                    element.text = LITERAL_SPACE.sub(" ", element.text)
+                if element is not node and element.tail:
+                    element.tail = LITERAL_SPACE.sub(" ", element.tail)
+        by_path[match.path][node] = Section(title, "正文", match.reason)
+    return by_path
 
 
 def remove_split_markers(text, marker, decisions):
@@ -774,15 +885,38 @@ def remove_split_markers(text, marker, decisions):
     return "".join(chunks), anchors
 
 
-def build_narration(source, pandoc, book_title=None, split=False):
+def narration_result(text, report, anchors, split):
+    parts = []
+    if split:
+        parts = split_parts(text, anchors, label_key)
+        report["分段"] = [{"文件": part.filename, "标题": part.section.title,
+                         "类型": part.section.kind, "字符数": len(part.text.rstrip()),
+                         **({"定位依据": part.section.basis} if part.section.basis else {})} for part in parts]
+        if not anchors:
+            report["分段提示"] = "没有识别到可分割的章节标题，整本正文收在一份 TXT 中。"
+    return text, report, parts
+
+
+def build_narration(source, pandoc, book_title=None, split=False, progress=None):
     with ZipFile(source) as archive:
         title, docs, nav, guide, skipped = read_package(archive)
-    title = book_title or title or source.stem
+        title = book_title or (title if title and not re.fullmatch(r"[0-9a-fA-F]{32}", title) else source.stem)
+        pages = find_scan_pages(archive, docs, nav, guide, tag, content, resolve, kind_of)
+        if pages:
+            navigation_labels = " ".join(entry.title for entries in nav.values() for entry in entries)
+            language = "zh" if re.search(f"[{HAN}]", title + source.stem + navigation_labels) else "en"
+            text, anchors, ocr = render_scan(archive, pages, language, label_key, progress)
+            report = {"文件": source.name, "书名": title, "阅读顺序文件数": len(docs), "未读入的条目": skipped,
+                      "可定位标题": [section.title for _, section in anchors], "输出字符数": len(text.rstrip()),
+                      "图像OCR": ocr}
+            return narration_result(text, report, anchors, split)
     chapters = []
     decisions = []
     marked = {}
     note_numbers = set()
     notes_by_chapter = defaultdict(set)
+    doc_paths = {doc.path for doc in docs}
+    continuing_toc = False
     for doc in docs:
         rows = text_rows(doc.body)
         reason = whole_document(doc, rows, nav[doc.path], guide[doc.path])
@@ -791,22 +925,27 @@ def build_narration(source, pandoc, book_title=None, split=False):
             marked[doc.body] = "整份注释文档" if reason == "注释" else reason
             if reason == "注释":
                 endnote_groups(rows, notes_by_chapter, note_numbers)
+            continuing_toc = False
             continue
         classify_nodes(doc, marked)
+        if continuing_toc:
+            continue_inline_toc(doc, rows, marked, doc_paths)
+        continuing_toc = bool(rows and marked.get(rows[-1][0]) == "目录或导航块")
 
     mark_note_links(docs, marked)
+    matched, unresolved = align_chapters(docs, nav, marked, inline_chapter_navigation(docs, marked),
+                                         label_key, kind_of)
+    chapter_heads = prepare_chapter_headings(docs, matched)
+    trust_navigation = bool(matched or unresolved)
     printable = etree.Element("html")
     body = etree.SubElement(printable, "body")
     counts = Counter()
     reflowed_inside = reflowed_lines = 0
     retained_files = 0
     sections = {}
-    if split:
-        prefix = f"epubtts{uuid4().hex}p"
-        marker = re.compile(rf"{prefix}\d+z")
-        split_policy = split_navigation(docs, nav, marked, title)
-    else:
-        marker = None
+    prefix = f"epubtts{uuid4().hex}p"
+    marker = re.compile(rf"{prefix}\d+z")
+    split_policy = split_navigation(docs, nav, marked, title)
     for doc in docs:
         if doc.body in marked:
             continue
@@ -825,13 +964,14 @@ def build_narration(source, pandoc, book_title=None, split=False):
             continue
         labels = {label_key(entry.title) for entry in nav[doc.path] if not kind_of(entry.title)}
         fragments = {entry.fragment for entry in nav[doc.path] if entry.fragment}
-        inside, lines = reflow_document(doc.body, labels, fragments, label_key)
+        aligned = chapter_heads[doc.path]
+        inside, lines = reflow_document(doc.body, labels, fragments, label_key, aligned)
         reflowed_inside += inside
         reflowed_lines += lines
         rows = text_rows(doc.body)
         titles = [value for node, value in rows
                   if tag(node) in HEADINGS or label_key(value) in labels]
-        if not titles:
+        if not titles and not aligned:
             first_title = next((entry.title for entry in nav[doc.path]
                                 if not entry.fragment and not kind_of(entry.title)), None)
             if first_title:
@@ -840,8 +980,12 @@ def build_narration(source, pandoc, book_title=None, split=False):
                 doc.body.insert(0, head)
                 titles.append(first_title)
                 rows.insert(0, (head, first_title))
-        if split:
-            mark_sections(doc, rows, nav[doc.path], split_policy, prefix, sections)
+        # Optional sections still use the existing classification rules. Chapter cuts use the
+        # source blocks selected before the cleanup removed anchors or rearranged paragraphs.
+        mark_sections(doc, rows, nav[doc.path], split_policy, prefix, sections, aligned, trust_navigation)
+        for node, section in aligned.items():
+            if doc.body in node.iterancestors():
+                mark_section(node, section, prefix, sections)
         chapters.extend(titles)
         retained_files += 1
         append_document(body, doc)
@@ -852,9 +996,10 @@ def build_narration(source, pandoc, book_title=None, split=False):
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     raw = raw.replace("\ufeff", "").replace("\u200b", "").replace("\u00ad", "")
     text, removed = clean_rendered(raw, title, marker)
-    anchors = []
-    if split:
-        text, anchors = remove_split_markers(text, marker, sections)
+    text, anchors = remove_split_markers(text, marker, sections)
+    rendered_chapters = Counter(section for _, section in anchors if section.basis)
+    planned_chapters = Counter(section for nodes in chapter_heads.values() for section in nodes.values())
+    lost = [section.title for section in (planned_chapters - rendered_chapters).elements()]
     if not text:
         raise ValueError("清洗后的正文为空。")
     report = {
@@ -868,18 +1013,12 @@ def build_narration(source, pandoc, book_title=None, split=False):
         "纯文本补充清洗": dict(removed),
         "硬换行修复": {"段内换行": reflowed_inside, "逐行段落": reflowed_lines},
         "可定位标题": chapters,
+        "章界对齐": {"成功": sum(rendered_chapters.values()),
+                    "未确认的目录章节": unresolved, "清洗后未保留的章界": lost},
         "输出字符数": len(text),
         "Pandoc 提示": pandoc_warning,
     }
-    text += "\n"
-    parts = []
-    if split:
-        parts = split_parts(text, anchors, label_key)
-        report["分段"] = [{"文件": part.filename, "标题": part.section.title,
-                         "类型": part.section.kind, "字符数": len(part.text.rstrip())} for part in parts]
-        if not anchors:
-            report["分段提示"] = "没有识别到可分割的章节标题，整本正文收在一份 TXT 中。"
-    return text, report, parts
+    return narration_result(text + "\n", report, anchors, split)
 
 
 def extract(source, pandoc, book_title=None):
@@ -965,7 +1104,8 @@ def main(argv=None):
                     print(f"跳过已有输出 {target}")
                     continue
                 raise FileExistsError(f"输出已存在：{collision}")
-            text, report, parts = build_narration(book, executable, args.title, args.split)
+            text, report, parts = build_narration(book, executable, args.title, args.split,
+                                                  lambda status: print(status, file=sys.stderr))
             if args.preview:
                 print(json.dumps(report, ensure_ascii=False, indent=2))
                 continue

@@ -15,7 +15,7 @@ VOLUME = re.compile(
 )
 INTRO = re.compile(
     r"^(?:(?:重刊|再版|新版|初版|修订版|再印)?(?:序言|序章|前言|导言|導言|导读|導讀)|"
-    r"(?:序|原序|作者序|自序|代序|引子|楔子|绪论|緒論)(?:$|[\s:：])|"
+    r"(?:(?:重刊|再版|新版|初版|修订版|再印)序|序|原序|作者序|自序|代序|引子|楔子|绪论|緒論)(?:$|[\s:：])|"
     r"(?:preface|foreword|prologue|introduction)\b)|"
     r"(?:译丛序|譯叢序|丛书序|叢書序|[（(](?:序|代序|序言|前言)[）)])$", re.I
 )
@@ -50,6 +50,7 @@ class NavEntry:
 class Section:
     title: str
     kind: str
+    basis: str = ""
 
 
 @dataclass(frozen=True)

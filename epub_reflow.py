@@ -208,12 +208,12 @@ def merge_lines(lines, layout):
     return repaired
 
 
-def reflow_document(body, titles, fragments, title_key):
+def reflow_document(body, titles, fragments, title_key, protected=()):
     inside = 0
     groups = defaultdict(list)
     for node in list(body.iter()):
         name = element_tag(node)
-        if name not in {"p", "div"}:
+        if node in protected or name not in {"p", "div"}:
             continue
         if name == "div" and (not node.text or not node.text.strip() or any(
             element_tag(child) in {"p", "div", "section", "article", "ol", "ul", "table"}
